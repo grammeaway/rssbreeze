@@ -1,4 +1,4 @@
-module github.com/grammeaway/awsbreeze
+module github.com/grammeaway/rssbreeze
 
 go 1.24.4
 

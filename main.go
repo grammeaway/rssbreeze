@@ -6,25 +6,26 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
-	"strconv"
+
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbletea"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
 const (
-	awsRSSURL        = "https://aws.amazon.com/about-aws/whats-new/recent/feed/"
-	cacheFileName    = "awsbreeze/seen.json"
-	oldCacheFileName = ".awsbreeze.json"
-	bookmarksFileName = "awsbreeze/bookmarks.json"
+	cacheFileName     = "rssbreeze/seen.json"
+	bookmarksFileName = "rssbreeze/bookmarks.json"
+	feedsFileName     = "rssbreeze/feeds.json"
 )
 
 var (
@@ -50,12 +51,22 @@ type Item struct {
 	GUID        string `xml:"guid"`
 }
 
+// Feed configuration
+type Feed struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+type FeedsConfig struct {
+	Feeds []Feed `json:"feeds"`
+}
+
 // Application state
 type Config struct {
 	LastSeen map[string]bool `json:"last_seen"`
 }
 
-// Bookmarks file structure
+// Bookmarks
 type BookmarksFile struct {
 	Bookmarks map[string]BookmarkEntry `json:"bookmarks"`
 }
@@ -74,6 +85,7 @@ type NewsItem struct {
 	GUID         string
 	IsNew        bool
 	IsBookmarked bool
+	FeedName     string
 }
 
 func (i NewsItem) FilterValue() string { return i.Title }
@@ -89,15 +101,16 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 		return
 	}
 
-	var title, desc string
 	isSelected := index == m.Index()
 
-	titleStyle   := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-	descStyle    := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	dateStyle    := lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
-	newStyle     := lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	titleStyle    := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	descStyle     := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	dateStyle     := lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	feedStyle     := lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
+	newStyle      := lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
 	bookmarkStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 
+	var title string
 	prefix := ""
 	if i.IsNew && i.IsBookmarked {
 		prefix = newStyle.Render("● ") + bookmarkStyle.Render("★ ")
@@ -110,26 +123,26 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	} else {
 		title = titleStyle.Render(i.Title)
 	}
-
 	if prefix != "" {
 		title = prefix + title
 	}
 
-	desc = descStyle.Render(strings.TrimSpace(stripHTML(i.Description)))
+	desc := strings.TrimSpace(stripHTML(i.Description))
 	if len(desc) > 80 {
 		desc = desc[:77] + "..."
 	}
+	desc = descStyle.Render(desc)
 
-	date := dateStyle.Render(i.PubDate.Format("Jan 2, 2006"))
+	meta := feedStyle.Render("["+i.FeedName+"]") + " " + dateStyle.Render(i.PubDate.Format("Jan 2, 2006"))
 
 	if isSelected {
 		selectedStyle := lipgloss.NewStyle().
 			Background(lipgloss.Color("62")).
 			Foreground(lipgloss.Color("15")).
 			Padding(0, 1)
-		fmt.Fprint(w, selectedStyle.Render(fmt.Sprintf("%s\n%s\n%s", title, desc, date)))
+		fmt.Fprint(w, selectedStyle.Render(fmt.Sprintf("%s\n%s\n%s", title, desc, meta)))
 	} else {
-		fmt.Fprintf(w, "%s\n%s\n%s", title, desc, date)
+		fmt.Fprintf(w, "%s\n%s\n%s", title, desc, meta)
 	}
 }
 
@@ -138,19 +151,26 @@ type model struct {
 	items         []NewsItem
 	config        Config
 	bookmarks     BookmarksFile
+	feeds         FeedsConfig
 	loading       bool
 	err           error
 	filterInput   textinput.Model
 	filtering     bool
 	filterDays    int
+	filterFeed    string
 	showBookmarks bool
 	showHelp      bool
+	addingFeed    bool
+	addFeedStep   int // 0 = name, 1 = URL
+	feedNameInput textinput.Model
+	feedURLInput  textinput.Model
 }
 
 type fetchedMsg []NewsItem
 type errMsg error
 
 func initialModel() model {
+	feeds     := loadFeeds()
 	config    := loadConfig()
 	bookmarks := loadBookmarks()
 
@@ -158,9 +178,17 @@ func initialModel() model {
 	filterInput.Placeholder = "Enter number of days (e.g., 7)"
 	filterInput.Width = 20
 
+	feedNameInput := textinput.New()
+	feedNameInput.Placeholder = "e.g., Hacker News"
+	feedNameInput.Width = 30
+
+	feedURLInput := textinput.New()
+	feedURLInput.Placeholder = "https://news.ycombinator.com/rss"
+	feedURLInput.Width = 50
+
 	items := []list.Item{}
 	l := list.New(items, itemDelegate{}, 0, 0)
-	l.Title = "awsbreeze - AWS What's New"
+	l.Title = "rssbreeze"
 	l.SetShowStatusBar(true)
 	l.SetFilteringEnabled(false)
 	l.Styles.Title = lipgloss.NewStyle().
@@ -170,55 +198,86 @@ func initialModel() model {
 		Bold(true)
 
 	return model{
-		list:        l,
-		config:      config,
-		bookmarks:   bookmarks,
-		loading:     true,
-		filterInput: filterInput,
-		filterDays:  0,
+		list:          l,
+		config:        config,
+		bookmarks:     bookmarks,
+		feeds:         feeds,
+		loading:       len(feeds.Feeds) > 0,
+		filterInput:   filterInput,
+		feedNameInput: feedNameInput,
+		feedURLInput:  feedURLInput,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return fetchNews
+	if len(m.feeds.Feeds) == 0 {
+		return nil
+	}
+	return fetchAllFeeds(m.feeds.Feeds)
 }
 
-func fetchNews() tea.Msg {
-	resp, err := http.Get(awsRSSURL)
+func fetchAllFeeds(feeds []Feed) tea.Cmd {
+	return func() tea.Msg {
+		type result struct {
+			items []NewsItem
+			err   error
+		}
+		ch := make(chan result, len(feeds))
+		for _, feed := range feeds {
+			go func(f Feed) {
+				items, err := fetchFeed(f)
+				ch <- result{items, err}
+			}(feed)
+		}
+		var allItems []NewsItem
+		for range feeds {
+			r := <-ch
+			if r.err != nil {
+				fmt.Fprintf(os.Stderr, "Error fetching feed: %v\n", r.err)
+				continue
+			}
+			allItems = append(allItems, r.items...)
+		}
+		sort.Slice(allItems, func(i, j int) bool {
+			return allItems[i].PubDate.After(allItems[j].PubDate)
+		})
+		return fetchedMsg(allItems)
+	}
+}
+
+func fetchFeed(feed Feed) ([]NewsItem, error) {
+	resp, err := http.Get(feed.URL)
 	if err != nil {
-		return errMsg(err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return errMsg(err)
+		return nil, err
 	}
 
 	var rss RSS
-	err = xml.Unmarshal(body, &rss)
-	if err != nil {
-		return errMsg(err)
+	if err := xml.Unmarshal(body, &rss); err != nil {
+		return nil, err
 	}
 
 	var items []NewsItem
 	for _, item := range rss.Channel.Items {
-		pubDate := parseAWSDate(item.PubDate)
+		guid := item.GUID
+		if guid == "" {
+			guid = item.Link
+		}
 		items = append(items, NewsItem{
 			Title:       item.Title,
 			Link:        item.Link,
 			Description: item.Description,
-			PubDate:     pubDate,
-			GUID:        item.GUID,
+			PubDate:     parseRSSDate(item.PubDate),
+			GUID:        guid,
+			FeedName:    feed.Name,
 		})
 	}
-
-	// Sort by date (newest first)
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].PubDate.After(items[j].PubDate)
-	})
-
-	return fetchedMsg(items)
+	return items, nil
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -230,15 +289,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fetchedMsg:
 		m.loading = false
+		m.err = nil
 		m.items = []NewsItem(msg)
-
 		for i := range m.items {
 			_, seen := m.config.LastSeen[m.items[i].GUID]
 			m.items[i].IsNew = !seen
 			_, bookmarked := m.bookmarks.Bookmarks[m.items[i].GUID]
 			m.items[i].IsBookmarked = bookmarked
 		}
-
 		m.applyFilters()
 		return m, nil
 
@@ -248,16 +306,64 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Add-feed input mode
+		if m.addingFeed {
+			switch msg.String() {
+			case "esc":
+				m.addingFeed = false
+				m.addFeedStep = 0
+				m.feedNameInput.SetValue("")
+				m.feedURLInput.SetValue("")
+				m.feedNameInput.Blur()
+				m.feedURLInput.Blur()
+				return m, nil
+			case "enter":
+				if m.addFeedStep == 0 {
+					if strings.TrimSpace(m.feedNameInput.Value()) == "" {
+						return m, nil
+					}
+					m.addFeedStep = 1
+					m.feedNameInput.Blur()
+					m.feedURLInput.Focus()
+					return m, nil
+				}
+				rawURL := strings.TrimSpace(m.feedURLInput.Value())
+				if rawURL == "" {
+					return m, nil
+				}
+				name := strings.TrimSpace(m.feedNameInput.Value())
+				m.feeds.Feeds = append(m.feeds.Feeds, Feed{Name: name, URL: rawURL})
+				saveFeeds(m.feeds)
+				m.addingFeed = false
+				m.addFeedStep = 0
+				m.feedNameInput.SetValue("")
+				m.feedURLInput.SetValue("")
+				m.feedNameInput.Blur()
+				m.feedURLInput.Blur()
+				m.loading = true
+				return m, fetchAllFeeds(m.feeds.Feeds)
+			}
+			var cmd tea.Cmd
+			if m.addFeedStep == 0 {
+				m.feedNameInput, cmd = m.feedNameInput.Update(msg)
+			} else {
+				m.feedURLInput, cmd = m.feedURLInput.Update(msg)
+			}
+			return m, cmd
+		}
+
+		// Date-filter input mode
 		if m.filtering {
 			switch msg.String() {
 			case "enter":
-				days := parseDays(m.filterInput.Value())
-				m.filterDays = days
+				m.filterDays = parseDays(m.filterInput.Value())
 				m.filtering = false
+				m.filterInput.Blur()
 				m.applyFilters()
 				return m, nil
 			case "esc":
 				m.filtering = false
+				m.filterInput.Blur()
 				return m, nil
 			}
 			var cmd tea.Cmd
@@ -290,17 +396,76 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "r":
-			m.loading = true
-			return m, fetchNews
+			if len(m.feeds.Feeds) > 0 {
+				m.loading = true
+				return m, fetchAllFeeds(m.feeds.Feeds)
+			}
+			return m, nil
 
 		case "f":
 			m.filtering = true
 			m.filterInput.Focus()
 			return m, nil
 
+		case "F":
+			// Cycle through feed filter: all → feed1 → feed2 → ... → all
+			if len(m.feeds.Feeds) == 0 {
+				return m, nil
+			}
+			if m.filterFeed == "" {
+				m.filterFeed = m.feeds.Feeds[0].Name
+			} else {
+				cycled := false
+				for i, f := range m.feeds.Feeds {
+					if f.Name == m.filterFeed {
+						if i+1 < len(m.feeds.Feeds) {
+							m.filterFeed = m.feeds.Feeds[i+1].Name
+						} else {
+							m.filterFeed = ""
+						}
+						cycled = true
+						break
+					}
+				}
+				if !cycled {
+					m.filterFeed = ""
+				}
+			}
+			m.applyFilters()
+			return m, nil
+
+		case "a":
+			m.addingFeed = true
+			m.addFeedStep = 0
+			m.feedNameInput.Focus()
+			return m, nil
+
+		case "D":
+			// Delete the feed currently active in the feed filter
+			if m.filterFeed == "" {
+				return m, nil
+			}
+			newFeeds := make([]Feed, 0, len(m.feeds.Feeds))
+			for _, f := range m.feeds.Feeds {
+				if f.Name != m.filterFeed {
+					newFeeds = append(newFeeds, f)
+				}
+			}
+			m.feeds.Feeds = newFeeds
+			saveFeeds(m.feeds)
+			m.filterFeed = ""
+			if len(m.feeds.Feeds) > 0 {
+				m.loading = true
+				return m, fetchAllFeeds(m.feeds.Feeds)
+			}
+			m.items = nil
+			m.applyFilters()
+			return m, nil
+
 		case "c":
 			m.filterDays = 0
 			m.showBookmarks = false
+			m.filterFeed = ""
 			m.applyFilters()
 			return m, nil
 
@@ -321,7 +486,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) toggleBookmark(guid string) {
-	// Find the item
 	var target *NewsItem
 	for i := range m.items {
 		if m.items[i].GUID == guid {
@@ -332,13 +496,10 @@ func (m *model) toggleBookmark(guid string) {
 	if target == nil {
 		return
 	}
-
 	if target.IsBookmarked {
-		// Remove bookmark
 		delete(m.bookmarks.Bookmarks, guid)
 		target.IsBookmarked = false
 	} else {
-		// Add bookmark
 		if m.bookmarks.Bookmarks == nil {
 			m.bookmarks.Bookmarks = make(map[string]BookmarkEntry)
 		}
@@ -349,31 +510,31 @@ func (m *model) toggleBookmark(guid string) {
 		}
 		target.IsBookmarked = true
 	}
-
 	saveBookmarks(m.bookmarks)
 	m.applyFilters()
 }
 
 func (m *model) applyFilters() {
-	var filteredItems []list.Item
-
+	var filtered []list.Item
 	for _, item := range m.items {
 		if m.showBookmarks && !item.IsBookmarked {
 			continue
 		}
-		if m.filterDays > 0 {
-			daysDiff := int(time.Since(item.PubDate).Hours() / 24)
-			if daysDiff > m.filterDays {
-				continue
-			}
+		if m.filterDays > 0 && int(time.Since(item.PubDate).Hours()/24) > m.filterDays {
+			continue
 		}
-		filteredItems = append(filteredItems, item)
+		if m.filterFeed != "" && item.FeedName != m.filterFeed {
+			continue
+		}
+		filtered = append(filtered, item)
 	}
+	m.list.SetItems(filtered)
 
-	m.list.SetItems(filteredItems)
-
-	title := "AWS What's New"
-	parts := []string{}
+	title := "rssbreeze"
+	var parts []string
+	if m.filterFeed != "" {
+		parts = append(parts, m.filterFeed)
+	}
 	if m.showBookmarks {
 		parts = append(parts, "Bookmarks")
 	}
@@ -391,8 +552,6 @@ func (m *model) markAsSeen(guid string) {
 		m.config.LastSeen = make(map[string]bool)
 	}
 	m.config.LastSeen[guid] = true
-	
-	// Update the item in our list
 	for i := range m.items {
 		if m.items[i].GUID == guid {
 			m.items[i].IsNew = false
@@ -406,307 +565,266 @@ func (m *model) markAllAsSeen() {
 	if m.config.LastSeen == nil {
 		m.config.LastSeen = make(map[string]bool)
 	}
-	
 	for i := range m.items {
 		m.config.LastSeen[m.items[i].GUID] = true
 		m.items[i].IsNew = false
 	}
-
-	// Save config immediately
 	m.saveConfig()
 }
 
 func parseDays(input string) int {
-	if input == "" {
-		return 0
-	}
-
-	days, err := strconv.Atoi(input)
+	days, err := strconv.Atoi(strings.TrimSpace(input))
 	if err != nil || days < 0 {
 		return 0
 	}
 	return days
 }
 
-func (m *model) saveConfig() {
-	m.cleanupConfig()
-
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return
-	}
-
-	configPath := filepath.Join(cacheDir, cacheFileName)
-	data, err := json.Marshal(m.config)
-	if err != nil {
-		return
-	}
-
-	os.WriteFile(configPath, data, 0644)
-}
-
-func (m *model) cleanupConfig() {
-	if m.config.LastSeen == nil {
-		return
-	}
-	
-	// Keep only entries from items we still have (current RSS feed)
-	// This automatically removes old entries that are no longer in the feed
-	currentGUIDs := make(map[string]bool)
-	for _, item := range m.items {
-		currentGUIDs[item.GUID] = true
-	}
-	
-	// Create new map with only current items
-	newLastSeen := make(map[string]bool)
-	for guid, seen := range m.config.LastSeen {
-		if currentGUIDs[guid] {
-			newLastSeen[guid] = seen
-		}
-	}
-	
-	m.config.LastSeen = newLastSeen
-}
-
 func (m model) View() string {
+	if len(m.feeds.Feeds) == 0 && !m.addingFeed {
+		return "No feeds configured.\n\nPress 'a' to add your first RSS feed.\nPress 'q' to quit."
+	}
+
 	if m.loading {
-		return "Fetching AWS news...\n\nPress 'q' to quit"
+		return fmt.Sprintf("Fetching news from %d feed(s)...\n\nPress 'q' to quit", len(m.feeds.Feeds))
 	}
 
 	if m.err != nil {
 		return fmt.Sprintf("Error: %v\n\nPress 'r' to retry or 'q' to quit", m.err)
 	}
 
-	view := m.list.View()
+	var view string
+	if len(m.feeds.Feeds) == 0 {
+		// addingFeed must be true
+		view = "No feeds configured yet."
+	} else {
+		view = m.list.View()
+	}
 
 	if m.filtering {
 		filterView := lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			Padding(1).
 			Render(fmt.Sprintf("Filter by days:\n%s\n\nPress Enter to apply, Esc to cancel", m.filterInput.View()))
-
 		view = lipgloss.JoinVertical(lipgloss.Left, view, filterView)
+	}
+
+	if m.addingFeed {
+		var content string
+		if m.addFeedStep == 0 {
+			content = fmt.Sprintf("Add RSS feed\n\nFeed name:\n%s\n\nPress Enter to continue, Esc to cancel", m.feedNameInput.View())
+		} else {
+			content = fmt.Sprintf("Add RSS feed\n\nFeed name: %s\nFeed URL:\n%s\n\nPress Enter to add, Esc to cancel", m.feedNameInput.Value(), m.feedURLInput.View())
+		}
+		addView := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			Padding(1).
+			Render(content)
+		view = lipgloss.JoinVertical(lipgloss.Left, view, addView)
 	}
 
 	statusLine := "Press 'h' for help"
 	if m.showHelp {
-		help := `
-Controls:
+		var feedNames []string
+		for _, f := range m.feeds.Feeds {
+			feedNames = append(feedNames, f.Name)
+		}
+		feedList := ""
+		if len(feedNames) > 0 {
+			feedList = "\nConfigured feeds: " + strings.Join(feedNames, ", ")
+		}
+		statusLine = `Controls:
   ↑/↓ or j/k  - Navigate items
   Enter       - Open selected item in browser
   b           - Toggle bookmark on selected item
   B           - Toggle bookmarks-only filter
-  r           - Refresh news
+  r           - Refresh all feeds
   f           - Filter by date (days)
+  F           - Cycle through feed filter
+  a           - Add a new RSS feed
+  D           - Delete the active feed filter's feed
   c           - Clear all filters
-  n           - Mark all as seen (clear new indicators)
+  n           - Mark all as seen
   h           - Toggle this help
   q           - Quit
 
-● Green dots indicate new items since last time you opened awsbreeze.
-★ Yellow stars indicate bookmarked items.
-`
-		statusLine = help
+● Green dots indicate unread items.
+★ Yellow stars indicate bookmarked items.` + feedList
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, view, statusLine)
 }
 
-// --- Bookmark persistence ---
+// --- Feed persistence ---
 
-func bookmarksFilePath() (string, error) {
+func loadFeeds() FeedsConfig {
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return "", err
+		return FeedsConfig{}
 	}
-	return filepath.Join(cacheDir, bookmarksFileName), nil
+	data, err := os.ReadFile(filepath.Join(cacheDir, feedsFileName))
+	if err != nil {
+		return FeedsConfig{}
+	}
+	var fc FeedsConfig
+	if err := json.Unmarshal(data, &fc); err != nil {
+		return FeedsConfig{}
+	}
+	return fc
 }
 
+func saveFeeds(fc FeedsConfig) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return
+	}
+	path := filepath.Join(cacheDir, feedsFileName)
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+		return
+	}
+	data, err := json.MarshalIndent(fc, "", "  ")
+	if err != nil {
+		return
+	}
+	os.WriteFile(path, data, 0644)
+}
+
+// --- Bookmark persistence ---
+
 func loadBookmarks() BookmarksFile {
-	path, err := bookmarksFilePath()
+	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return BookmarksFile{Bookmarks: make(map[string]BookmarkEntry)}
 	}
-
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Join(cacheDir, bookmarksFileName))
 	if err != nil {
-		// File doesn't exist yet — that's fine, start empty
 		return BookmarksFile{Bookmarks: make(map[string]BookmarkEntry)}
 	}
-
 	var bf BookmarksFile
 	if err := json.Unmarshal(data, &bf); err != nil {
 		return BookmarksFile{Bookmarks: make(map[string]BookmarkEntry)}
 	}
-
 	if bf.Bookmarks == nil {
 		bf.Bookmarks = make(map[string]BookmarkEntry)
 	}
-
 	return bf
 }
 
 func saveBookmarks(bf BookmarksFile) {
-	path, err := bookmarksFilePath()
+	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return
 	}
-
-	// Ensure the directory exists (it should already, but be safe)
+	path := filepath.Join(cacheDir, bookmarksFileName)
 	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating bookmarks directory: %v\n", err)
 		return
 	}
-
 	data, err := json.MarshalIndent(bf, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error marshalling bookmarks: %v\n", err)
 		return
 	}
-
 	if err := os.WriteFile(path, data, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing bookmarks file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error writing bookmarks: %v\n", err)
 	}
 }
 
-// --- Config / cache helpers (unchanged) ---
+// --- Config / seen-items persistence ---
 
 func loadConfig() Config {
-	if !cacheDirExists() {
-		if err := createCacheDir(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating cache directory: %v\n", err)
-			return Config{LastSeen: make(map[string]bool)}
-		}
-	}
-	if oldCacheExists() {
-		moveAndCleanupOldCache()
-	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return Config{LastSeen: make(map[string]bool)}
 	}
+	// Ensure cache dir exists
+	os.MkdirAll(filepath.Join(cacheDir, "rssbreeze"), os.ModePerm)
 
-	cachePath := filepath.Join(cacheDir, cacheFileName)
-	data, err := os.ReadFile(cachePath)
+	data, err := os.ReadFile(filepath.Join(cacheDir, cacheFileName))
 	if err != nil {
 		return Config{LastSeen: make(map[string]bool)}
 	}
-
 	var config Config
-	err = json.Unmarshal(data, &config)
-	if err != nil {
+	if err := json.Unmarshal(data, &config); err != nil {
 		return Config{LastSeen: make(map[string]bool)}
 	}
-
 	if config.LastSeen == nil {
 		config.LastSeen = make(map[string]bool)
 	}
-
 	return config
 }
 
-func cacheDirExists() bool {
+func (m *model) saveConfig() {
+	m.cleanupConfig()
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return false
+		return
 	}
-	
-	// Check if the cache directory exists
-	_, err = os.Stat(filepath.Join(cacheDir, "awsbreeze"))
-	return !os.IsNotExist(err)
+	data, err := json.Marshal(m.config)
+	if err != nil {
+		return
+	}
+	os.WriteFile(filepath.Join(cacheDir, cacheFileName), data, 0644)
 }
 
-func oldCacheExists() bool {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return false
+func (m *model) cleanupConfig() {
+	if m.config.LastSeen == nil {
+		return
 	}
-	oldCachePath := filepath.Join(homeDir, oldCacheFileName)
-	_, err = os.Stat(oldCachePath)
-	return !os.IsNotExist(err)
-}
-
-func createCacheDir() error {
-	// Check if the cache directory exists
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return err
+	currentGUIDs := make(map[string]bool, len(m.items))
+	for _, item := range m.items {
+		currentGUIDs[item.GUID] = true
 	}
-
-	// Create the cache directory if it doesn't exist
-	if _, err := os.Stat(filepath.Join(cacheDir, "awsbreeze")); os.IsNotExist(err) {
-		err = os.MkdirAll(filepath.Join(cacheDir, "awsbreeze"), os.ModePerm)
-		if err != nil {
-			return fmt.Errorf("failed to create cache directory: %w", err)
+	newLastSeen := make(map[string]bool)
+	for guid, seen := range m.config.LastSeen {
+		if currentGUIDs[guid] {
+			newLastSeen[guid] = seen
 		}
 	}
-	return nil
+	m.config.LastSeen = newLastSeen
 }
 
-func moveAndCleanupOldCache() {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return
+// sanitizeURL fixes malformed URLs sometimes found in RSS feeds, such as a
+// missing '/' between the domain and the path (e.g., "example.compath" →
+// "example.com/path"). Uses net/url parsing to detect when path content has
+// been absorbed into the host component.
+func sanitizeURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rawURL
 	}
-	oldCachePath := filepath.Join(homeDir, oldCacheFileName)
-	newCacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return
+	hostname := u.Hostname()
+	port := ""
+	if p := u.Port(); p != "" {
+		port = ":" + p
 	}
-	newCachePath := filepath.Join(newCacheDir, cacheFileName)
-	if _, err := os.Stat(oldCachePath); os.IsNotExist(err) {
-		return // Old cache file doesn't exist, nothing to do
-	}
-
-	// Ensure the cache directory exists
-	err = createCacheDir()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating cache directory: %v\n", err)
-		return
-	}
-	// Move old cache file to new location
-	err = os.Rename(oldCachePath, newCachePath)
-	if err != nil {
-		if os.IsExist(err) {
-			// If the new cache file already exists, we can ignore the error
-			return
+	for _, tld := range []string{".com", ".org", ".net", ".io", ".dev", ".gov", ".edu"} {
+		idx := strings.Index(hostname, tld)
+		if idx == -1 {
+			continue
 		}
-		fmt.Fprintf(os.Stderr, "Error moving old cache file: %v\n", err)
-		return
-	}
-	// Remove the old cache file if it exists
-	if _, err := os.Stat(oldCachePath); err == nil {
-		err = os.Remove(oldCachePath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error removing old cache file: %v\n", err)
+		after := idx + len(tld)
+		// Only fix if the character after the TLD is not '.', ':', or end of string
+		// (a dot would indicate a subdomain like .com.au; a colon would be a port)
+		if after < len(hostname) && hostname[after] != '.' && hostname[after] != ':' {
+			absorbed := hostname[after:]
+			u.Host = hostname[:after] + port
+			u.Path = "/" + absorbed + u.Path
+			return u.String()
 		}
 	}
-
-	return
+	return rawURL
 }
 
-// For some reason, some of the URLs from the feed, are missing a '/' between .com and the rest of the URL.
-func sanitizeURL(url string) string { 
-	faultyPattern := ".comabout-aws"
-	if strings.Contains(url, faultyPattern) {
-		// Insert a '/' after '.com'
-		url = strings.Replace(url, faultyPattern, ".com/about-aws", 1)
-	}
-	return url
-
-}
-
-func openURL(url string) tea.Cmd {
+func openURL(rawURL string) tea.Cmd {
 	return func() tea.Msg {
+		rawURL = sanitizeURL(rawURL)
 		var cmd *exec.Cmd
-		url = sanitizeURL(url) // Sanitize the URL before opening
 		switch runtime.GOOS {
 		case "linux":
-			cmd = exec.Command("xdg-open", url)
+			cmd = exec.Command("xdg-open", rawURL)
 		case "windows":
-			cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+			cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL)
 		case "darwin":
-			cmd = exec.Command("open", url)
+			cmd = exec.Command("open", rawURL)
 		default:
 			return nil
 		}
@@ -716,50 +834,42 @@ func openURL(url string) tea.Cmd {
 }
 
 func stripHTML(s string) string {
-	// Simple HTML tag removal
-	result := ""
+	result := strings.Builder{}
 	inTag := false
-	
 	for _, r := range s {
 		if r == '<' {
 			inTag = true
 		} else if r == '>' {
 			inTag = false
 		} else if !inTag {
-			result += string(r)
+			result.WriteRune(r)
 		}
 	}
-	
-	return strings.TrimSpace(result)
+	return strings.TrimSpace(result.String())
 }
 
-func parseAWSDate(dateStr string) time.Time {
-	// Try common RSS date formats
+func parseRSSDate(dateStr string) time.Time {
 	formats := []string{
-		"Mon, 02 Jan 2006 15:04:05 -0700",  // RFC 1123 with timezone
-		"Mon, 02 Jan 2006 15:04:05 MST",    // RFC 1123 with named timezone
-		"Mon, 02 Jan 2006 15:04:05 GMT",    // RFC 1123 GMT
-		"2006-01-02T15:04:05-07:00",        // RFC 3339
-		"2006-01-02T15:04:05Z",             // RFC 3339 UTC
-		"2006-01-02 15:04:05",              // Simple format
-		"Jan 02, 2006 15:04:05",            // Alternative format
+		"Mon, 02 Jan 2006 15:04:05 -0700",
+		"Mon, 02 Jan 2006 15:04:05 MST",
+		"Mon, 02 Jan 2006 15:04:05 GMT",
+		"2006-01-02T15:04:05-07:00",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02 15:04:05",
+		"Jan 02, 2006 15:04:05",
 	}
-	
 	for _, format := range formats {
 		if t, err := time.Parse(format, dateStr); err == nil {
 			return t
 		}
 	}
-	
-	// If all parsing fails, return current time as fallback
-	// but log the issue for debugging
-	fmt.Fprintf(os.Stderr, "Warning: Could not parse date '%s', using current time\n", dateStr)
+	fmt.Fprintf(os.Stderr, "Warning: could not parse date %q, using current time\n", dateStr)
 	return time.Now()
 }
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Printf("awsbreeze version: %s\ncommit: %s\nbuilt at: %s\n", version, commit, date)
+		fmt.Printf("rssbreeze version: %s\ncommit: %s\nbuilt at: %s\n", version, commit, date)
 		return
 	}
 
