@@ -1,4 +1,4 @@
-module github.com/grammeaway/rssbreeze
+module github.com/grammeaway/rssbreeze/v2
 
 go 1.26.1
 

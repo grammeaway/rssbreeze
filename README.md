@@ -9,7 +9,7 @@ Built with Go and the [Bubble Tea](https://github.com/charmbracelet/bubbletea) f
 
 ### With Go
 ```bash
-go install github.com/grammeaway/rssbreeze@latest
+go install github.com/grammeaway/rssbreeze/v2@latest
 ```
 
 This installs the `rssbreeze` binary to `$GOPATH/bin`. Make sure that directory is on your `PATH`.
@@ -19,7 +19,7 @@ Download the release for your OS from the [releases page](https://github.com/gra
 
 ### Nightly build
 ```bash
-go install github.com/grammeaway/rssbreeze@main
+go install github.com/grammeaway/rssbreeze/v2@main
 ```
 
 ## Verify installation
