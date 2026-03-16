@@ -1,6 +1,8 @@
 # rssbreeze
 An RSS reader that doesn't blow.
 
+![Screenshot of rssbreeze showing a list of articles from multiple feeds, with one article selected and a preview pane on the right.](./docs/preview.png)
+
 rssbreeze is a TUI for reading RSS feeds without leaving your terminal. Add any number of RSS feeds, browse headlines at a glance, open articles in your browser with a single keypress, bookmark items, and filter by feed or date range. rssbreeze tracks which articles you've already read so new items are always clearly marked.
 
 Built with Go and the [Bubble Tea](https://github.com/charmbracelet/bubbletea) framework. A fork of my previous project, [awsbreeze](https://github.com/grammeaway/awsbreeze), an AWS news reader that I built for myself, but I figured the core functionality could be useful to more people if it supported arbitrary RSS feeds.
