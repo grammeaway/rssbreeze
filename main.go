@@ -514,19 +514,25 @@ func (m *model) toggleBookmark(guid string) {
 	m.applyFilters()
 }
 
+func (m *model) itemMatchesFilters(item NewsItem) bool {
+	if m.showBookmarks && !item.IsBookmarked {
+		return false
+	}
+	if m.filterDays > 0 && int(time.Since(item.PubDate).Hours()/24) > m.filterDays {
+		return false
+	}
+	if m.filterFeed != "" && item.FeedName != m.filterFeed {
+		return false
+	}
+	return true
+}
+
 func (m *model) applyFilters() {
 	var filtered []list.Item
 	for _, item := range m.items {
-		if m.showBookmarks && !item.IsBookmarked {
-			continue
+		if m.itemMatchesFilters(item) {
+			filtered = append(filtered, item)
 		}
-		if m.filterDays > 0 && int(time.Since(item.PubDate).Hours()/24) > m.filterDays {
-			continue
-		}
-		if m.filterFeed != "" && item.FeedName != m.filterFeed {
-			continue
-		}
-		filtered = append(filtered, item)
 	}
 	m.list.SetItems(filtered)
 
@@ -566,6 +572,9 @@ func (m *model) markAllAsSeen() {
 		m.config.LastSeen = make(map[string]bool)
 	}
 	for i := range m.items {
+		if !m.itemMatchesFilters(m.items[i]) {
+			continue
+		}
 		m.config.LastSeen[m.items[i].GUID] = true
 		m.items[i].IsNew = false
 	}
@@ -644,7 +653,7 @@ func (m model) View() string {
   a           - Add a new RSS feed
   D           - Delete the active feed filter's feed
   c           - Clear all filters
-  n           - Mark all as seen
+  n           - Mark visible items as seen
   h           - Toggle this help
   q           - Quit
 
