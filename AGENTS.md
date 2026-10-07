@@ -44,6 +44,8 @@ Other top-level files: `main_test.go`, `docs/preview.png` (README screenshot), `
 
 **Key handling order in `Update`:** edit modal (`editing`, `editIndex` -1 = add, `editStep` 0 = name, 1 = URL), date-filter modal (`filtering`), delete confirmation (`confirmDelete`), help (any key closes it), `q`/`ctrl+c`/`h`, then `updateOverview` or `updateItems`. `esc` cancels a modal, goes from the items view back to the overview, and quits from the overview.
 
+**Overview cursor = current scope:** in the items view, the overview cursor stays on the row being shown. `tab`/`shift+tab` cycle by moving that cursor and calling `openSelected()`, the same path `Enter` takes. Preserve this if you add other ways into the items view.
+
 **Filtering and paging:** `itemMatchesFilters` is the single predicate (bookmarks-only, `filterDays`). `applyFilters` rebuilds the items list and its title from `scopeItems()`. In the blended scope it caps the list at `blendLimit`, which `updateItems` grows by `pageSize()` when the cursor reaches the last item. Built-in list fuzzy filtering is disabled.
 
 ## Gotchas

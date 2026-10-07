@@ -385,6 +385,14 @@ func (m *model) openScope(scope string) tea.Cmd {
 	return cmd
 }
 
+// openSelected opens the feed under the overview cursor, or All feeds on the first row.
+func (m *model) openSelected() tea.Cmd {
+	if _, f, ok := m.selectedFeed(); ok {
+		return m.openScope(f.Name)
+	}
+	return m.openScope("")
+}
+
 func (m *model) hasFeed(f Feed) bool {
 	for _, g := range m.feeds.Feeds {
 		if g == f {
@@ -595,11 +603,7 @@ func (m model) updateOverview(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.feeds.Feeds) == 0 {
 			return m, nil
 		}
-		_, f, ok := m.selectedFeed()
-		if !ok {
-			return m, m.openScope("")
-		}
-		return m, m.openScope(f.Name)
+		return m, m.openSelected()
 	case "a":
 		m.startEdit(-1)
 		return m, nil
@@ -631,6 +635,16 @@ func (m model) updateItems(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.view = overviewView
 		m.refreshOverview()
 		return m, nil
+
+	case "tab", "shift+tab":
+		// The overview cursor always marks the current scope, so cycling just moves it.
+		n := len(m.overview.Items())
+		step := 1
+		if msg.String() == "shift+tab" {
+			step = n - 1
+		}
+		m.overview.Select((m.overview.Index() + step) % n)
+		return m, m.openSelected()
 
 	case "enter":
 		if item, ok := m.list.SelectedItem().(NewsItem); ok {
@@ -862,6 +876,7 @@ Feed items:
   c           - Clear all filters
   n           - Mark visible items as seen
   r           - Refresh the feed(s) in view
+  tab         - Next feed (shift+tab: previous)
   esc         - Back to the overview
   q           - Quit
 

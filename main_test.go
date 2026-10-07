@@ -225,3 +225,27 @@ func TestStaleFetchResultIsDropped(t *testing.T) {
 		t.Error("result for an edited feed was applied")
 	}
 }
+
+func TestTabCyclesScopesInOverviewOrder(t *testing.T) {
+	m := testModel(Feed{"a", "u1"}, Feed{"b", "u2"})
+	next, _ := m.updateOverview(tea.KeyMsg{Type: tea.KeyEnter}) // All feeds
+	m = next.(model)
+	press := func(k tea.KeyType) string {
+		next, _ := m.updateItems(tea.KeyMsg{Type: k})
+		m = next.(model)
+		return m.scope
+	}
+	var got []string
+	for range 4 {
+		got = append(got, press(tea.KeyTab))
+	}
+	for range 2 {
+		got = append(got, press(tea.KeyShiftTab))
+	}
+	if want := []string{"a", "b", "", "a", "", "b"}; !reflect.DeepEqual(got, want) || m.view != itemsView {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if _, f, _ := m.selectedFeed(); f.Name != "b" {
+		t.Errorf("overview cursor out of sync with scope: %q", f.Name)
+	}
+}

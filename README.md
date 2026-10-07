@@ -66,6 +66,7 @@ Both RSS and Atom feeds are supported.
 | `c` | Clear all filters |
 | `n` | Mark all items matching the filters as seen |
 | `r` | Refresh the feed(s) in view |
+| `tab` / `shift+tab` | Switch to the next / previous feed (All feeds included), in overview order |
 | `esc` | Back to the overview |
 | `h` | Toggle help |
 | `q` | Quit |
